@@ -17,6 +17,10 @@
 #   KPTNCOOK_FLAKE   Nix flake ref to build kptncook from (default: repo root)
 #   KPTNCOOK_ACCESS_TOKEN  enables favorites backup
 #   BACKUP_FAVORITES 1/0 to force on/off (default: on when token present)
+#   RUN_MAINTENANCE  1/0 Mealie housekeeping after the weekly sweep (default 1):
+#                    repair-mealie, deduplicate-mealie, create-mealie-cookbooks,
+#                    categorize-mealie
+#   MAINTENANCE_ON_DAILY 1/0 also run housekeeping after the daily job (default 0)
 #   DAILY_TIME     default "06:00"
 #   WEEKLY_DAY     default "Mon"   (Mon Tue Wed Thu Fri Sat Sun)
 #   WEEKLY_TIME    default "06:30"
@@ -70,6 +74,8 @@ WEEKLY_DAY="${WEEKLY_DAY:-Mon}"
 WEEKLY_TIME="${WEEKLY_TIME:-06:30}"
 RUN_ON_START="${RUN_ON_START:-0}"
 BACKUP_FAVORITES="${BACKUP_FAVORITES:-}"
+RUN_MAINTENANCE="${RUN_MAINTENANCE:-1}"
+MAINTENANCE_ON_DAILY="${MAINTENANCE_ON_DAILY:-0}"
 
 # ---------- Resolve the kptncook CLI (PATH / nix develop / nix flake / uv) ----------
 KC_CMD=()
@@ -120,6 +126,9 @@ daily_job() {
             log "WARN: favorites Mealie push failed"
         fi
     fi
+    if [[ "$MAINTENANCE_ON_DAILY" == "1" ]]; then
+        maintenance_job
+    fi
 }
 
 weekly_job() {
@@ -127,6 +136,25 @@ weekly_job() {
     if ! bash "$SYNC_SCRIPT"; then
         log "WARN: weekly job failed"
     fi
+    maintenance_job
+}
+
+# Mealie housekeeping: repair failed imports, remove duplicates, ensure the
+# cookbooks exist, then apply categories/tools and repoint cookbooks to their
+# category filter. Each step is best-effort so one failure doesn't stop the rest.
+maintenance_job() {
+    if [[ "$RUN_MAINTENANCE" != "1" ]]; then
+        log "Maintenance disabled (RUN_MAINTENANCE=0)"
+        return 0
+    fi
+    log "Maintenance: repair failed imports"
+    kc repair-mealie --force || log "WARN: repair-mealie failed"
+    log "Maintenance: remove duplicate recipes"
+    kc deduplicate-mealie --force || log "WARN: deduplicate-mealie failed"
+    log "Maintenance: ensure cookbooks exist"
+    kc create-mealie-cookbooks || log "WARN: create-mealie-cookbooks failed"
+    log "Maintenance: apply categories + tools, repoint cookbooks"
+    kc categorize-mealie || log "WARN: categorize-mealie failed"
 }
 
 # Graceful shutdown for container/systemd usage
@@ -138,6 +166,7 @@ log "Scheduler started."
 log "  cli    : ${KC_CMD[*]}"
 log "  daily  : ${DAILY_TIME} (favorites: $(favorites_enabled && echo on || echo off))"
 log "  weekly : ${WEEKLY_DAY} ${WEEKLY_TIME}"
+log "  maint  : $([[ "$RUN_MAINTENANCE" == "1" ]] && echo on || echo off) (on daily: $([[ "$MAINTENANCE_ON_DAILY" == "1" ]] && echo on || echo off))"
 log "  TZ     : ${TZ:-system default}"
 
 if [[ "$RUN_ON_START" == "1" ]]; then

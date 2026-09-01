@@ -1,0 +1,20 @@
+# Runs the long-lived kptncook scheduler (daily/weekly sync + Mealie
+# maintenance). Build:  docker build -f Dockerfile.scheduler -t kptncook-scheduler .
+FROM python:3.14-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    KPTNCOOK_HOME=/data
+
+# bash is required by the scheduler/sync scripts; tzdata makes TZ work.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir kptncook
+
+COPY scripts/ /scripts/
+RUN chmod +x /scripts/*.sh
+
+VOLUME ["/data"]
+
+ENTRYPOINT ["bash", "/scripts/kpncook-scheduler.sh"]
