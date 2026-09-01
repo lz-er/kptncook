@@ -464,3 +464,266 @@ def test_get_discovery_screen_returns_structured_entries(monkeypatch):
     assert data.lists[0].title == "Trending"
     assert data.lists[0].list_type == "curated"
     assert data.quick_search == ["Winter"]
+
+
+def test_find_numbered_duplicates_only_when_base_name_exists():
+    recipes = [
+        SimpleNamespace(name="Pasta", slug="pasta"),
+        SimpleNamespace(name="Pasta (1)", slug="pasta-1"),
+        SimpleNamespace(name="Pasta (2)", slug="pasta-2"),
+        # base "Salad" is missing, so "Salad (1)" is kept
+        SimpleNamespace(name="Salad (1)", slug="salad-1"),
+        SimpleNamespace(name="Soup", slug="soup"),
+    ]
+
+    duplicates = workflows._find_numbered_duplicates(recipes)
+
+    assert [d.slug for d in duplicates] == ["pasta-1", "pasta-2"]
+
+
+def test_find_numbered_duplicates_ignores_stray_whitespace():
+    # Mealie sometimes stores a trailing space on the base and doubles the
+    # space before the "(N)" suffix; both should still be matched.
+    recipes = [
+        SimpleNamespace(name="Salat mit Bohnen ", slug="salat"),
+        SimpleNamespace(name="Salat mit Bohnen  (1)", slug="salat-1"),
+    ]
+
+    duplicates = workflows._find_numbered_duplicates(recipes)
+
+    assert [d.slug for d in duplicates] == ["salat-1"]
+
+
+def test_find_mealie_duplicates_uses_client(monkeypatch):
+    recipes = [
+        SimpleNamespace(name="Pizza", slug="pizza"),
+        SimpleNamespace(name="Pizza (1)", slug="pizza-1"),
+    ]
+
+    class FakeClient:
+        def get_all_recipes(self):
+            return recipes
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+
+    duplicates = workflows.find_mealie_duplicates()
+
+    assert [d.slug for d in duplicates] == ["pizza-1"]
+
+
+def test_delete_mealie_duplicates_reports_deleted_and_failed(monkeypatch):
+    deleted_slugs: list[str] = []
+
+    class FakeClient:
+        def delete_via_slug(self, slug):
+            if slug == "boom-1":
+                raise httpx.HTTPError("nope")
+            deleted_slugs.append(slug)
+            return {}
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+
+    duplicates = [
+        workflows.MealieRecipeRef(name="Ok (1)", slug="ok-1"),
+        workflows.MealieRecipeRef(name="Boom (1)", slug="boom-1"),
+    ]
+
+    result = workflows.delete_mealie_duplicates(duplicates)
+
+    assert deleted_slugs == ["ok-1"]
+    assert [d.slug for d in result.deleted] == ["ok-1"]
+    assert [d.slug for d, _ in result.failed] == ["boom-1"]
+
+
+def test_is_empty_recipe_uses_raw_camelcase_keys():
+    assert workflows._is_empty_recipe({"recipeInstructions": [], "recipeIngredient": []})
+    assert workflows._is_empty_recipe({})
+    assert not workflows._is_empty_recipe(
+        {"recipeInstructions": [{"text": "step"}], "recipeIngredient": []}
+    )
+    assert not workflows._is_empty_recipe(
+        {"recipeInstructions": [], "recipeIngredient": [{"note": "1 Cup Flour"}]}
+    )
+
+
+def test_find_mealie_empty_recipes_detects_only_empty(monkeypatch):
+    summaries = [
+        SimpleNamespace(name="Real", slug="real"),
+        SimpleNamespace(name="Empty", slug="empty"),
+    ]
+    details = {
+        "real": {
+            "name": "Real",
+            "recipeInstructions": [{"text": "cook"}],
+            "recipeIngredient": [{"note": "egg"}],
+        },
+        "empty": {"name": "Empty", "recipeInstructions": [], "recipeIngredient": []},
+    }
+
+    class FakeClient:
+        def get_all_recipes(self):
+            return summaries
+
+        def get_recipe_dict(self, slug):
+            return details[slug]
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+
+    empty = workflows.find_mealie_empty_recipes()
+
+    assert [ref.slug for ref in empty] == ["empty"]
+
+
+def test_is_broken_recipe_matches_placeholder_or_missing_steps():
+    # No steps at all -> broken.
+    assert workflows._is_broken_recipe({"recipeInstructions": []})
+    # Single default placeholder step -> broken (even with real ingredients).
+    assert workflows._is_broken_recipe(
+        {
+            "recipeInstructions": [
+                {"text": workflows._DEFAULT_STEP_PREFIX + "\n\n**Add a link**"}
+            ],
+            "recipeIngredient": [{"note": "Pfeffer"}],
+        }
+    )
+    # A real single step -> not broken.
+    assert not workflows._is_broken_recipe(
+        {"recipeInstructions": [{"text": "Chop the onion."}]}
+    )
+    # Multiple steps -> not broken.
+    assert not workflows._is_broken_recipe(
+        {"recipeInstructions": [{"text": "a"}, {"text": "b"}]}
+    )
+
+
+def test_repair_mealie_recipes_deletes_and_recreates_matched(monkeypatch, minimal):
+    broken = [
+        workflows.MealieRecipeRef(name="Minimal Recipe", slug="minimal-recipe"),
+        workflows.MealieRecipeRef(name="Unknown Recipe", slug="unknown-recipe"),
+    ]
+    source = workflows.kptncook_to_mealie(_recipe(minimal))
+
+    deleted: list[str] = []
+    created: list[str] = []
+
+    class FakeClient:
+        def delete_via_slug(self, slug):
+            deleted.append(slug)
+            return {}
+
+        def create_recipe(self, recipe):
+            created.append(recipe.name)
+            return SimpleNamespace(slug="new-slug")
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+    monkeypatch.setattr(
+        workflows,
+        "_repository_recipes_by_name",
+        lambda: {workflows._normalize_recipe_name(source.name): source},
+    )
+
+    # Align the first broken recipe's name with the repository source name.
+    broken[0] = workflows.MealieRecipeRef(name=source.name, slug="minimal-recipe")
+
+    result = workflows.repair_mealie_recipes(broken)
+
+    assert deleted == ["minimal-recipe"]
+    assert created == [source.name]
+    assert [ref.slug for ref in result.repaired] == ["minimal-recipe"]
+    assert [ref.slug for ref in result.unmatched] == ["unknown-recipe"]
+    assert result.failed == []
+
+
+def test_create_mealie_cookbooks_creates_updates_and_skips(monkeypatch):
+    tags = [
+        {"name": "diet_vegetarian", "slug": "diet-vegetarian", "id": "veg"},
+        {"name": "main_dish", "slug": "main-dish", "id": "main"},
+        {"name": "peanut_free", "slug": "peanut-free", "id": "pf"},
+        {"name": "cooking_time_under_20", "slug": "cooking-time-under-20", "id": "u20"},
+    ]
+    created: list[dict] = []
+    updated: list[tuple] = []
+
+    class FakeClient:
+        def get_all_tags(self):
+            return tags
+
+        def get_cookbooks(self):
+            return [{"id": "cb1", "name": "Diet Vegetarian", "slug": "diet-vegetarian"}]
+
+        def create_cookbook(self, payload):
+            created.append(payload)
+            return {**payload, "id": "new"}
+
+        def update_cookbook(self, cookbook_id, payload):
+            updated.append((cookbook_id, payload))
+            return payload
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+
+    result = workflows.create_mealie_cookbooks(
+        category_tags=["cooking_time_under_20", "diet_vegetarian", "unknown_tag"],
+        require_tags=["main_dish", "peanut_free"],
+    )
+
+    assert result.created == ["Cooking Time Under 20"]
+    assert result.updated == ["Diet Vegetarian"]
+    assert result.missing_tags == ["unknown_tag"]
+    qfs = created[0]["queryFilterString"]
+    assert qfs.startswith("tags.id CONTAINS ALL [")
+    assert '"u20"' in qfs and '"main"' in qfs and '"pf"' in qfs
+    assert updated[0][0] == "cb1"
+
+
+def test_create_mealie_cookbooks_errors_on_missing_required_tag(monkeypatch):
+    class FakeClient:
+        def get_all_tags(self):
+            return [{"name": "diet_vegetarian", "slug": "diet-vegetarian", "id": "veg"}]
+
+        def get_cookbooks(self):
+            return []
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+
+    with pytest.raises(workflows.UserFacingError):
+        workflows.create_mealie_cookbooks(
+            category_tags=["diet_vegetarian"], require_tags=["main_dish"]
+        )
+
+
+def test_plan_categorization_matches_rules_sources_and_tools():
+    records = [
+        # slug, source, tags, existing tools
+        ("veg-main", "kptncook",
+         {"diet_vegetarian", "main_dish", "peanut_free"}, set()),
+        ("veg-not-main", "kptncook", {"diet_vegetarian", "peanut_free"}, set()),
+        ("one-pot", "kptncook", {"one_pot", "main_dish"}, set()),
+        ("already-tooled", "kptncook", {"one_pot"}, {"One Pot"}),
+        ("manual", None, {"diet_vegetarian", "main_dish", "peanut_free"}, set()),
+    ]
+    rules = (
+        workflows.CategoryRule(
+            ("diet_vegetarian", "main_dish", "peanut_free"), "main_vegetarian"
+        ),
+    )
+    kptncook_slugs, rule_slugs, tool_assignments = workflows._plan_categorization(
+        records, rules, {"one_pot": "One Pot"}, add_tools=True
+    )
+
+    # only kptncook-source recipes get the kptncook category
+    assert kptncook_slugs == ["veg-main", "veg-not-main", "one-pot", "already-tooled"]
+    # rule requires ALL three tags (manual has them too, regardless of source)
+    assert rule_slugs["main_vegetarian"] == ["veg-main", "manual"]
+    # only recipes missing the derived tool get an assignment
+    assert tool_assignments == {"one-pot": {"One Pot"}}
+
+
+def test_plan_categorization_can_skip_tools():
+    records = [("one-pot", "kptncook", {"one_pot"}, set())]
+    _, _, tool_assignments = workflows._plan_categorization(
+        records, (), {"one_pot": "One Pot"}, add_tools=False
+    )
+    assert tool_assignments == {}
+
+
+

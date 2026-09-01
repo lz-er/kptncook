@@ -27,11 +27,18 @@ from kptncook.services.repository import save_recipe_entries
 from kptncook.services.workflows import (
     UserFacingError,
     backup_kptncook_favorites as backup_kptncook_favorites_workflow,
+    delete_mealie_duplicates as delete_mealie_duplicates_workflow,
     delete_recipes_by_selection,
     delete_repository_recipes,
     export_recipes_to_markdown_result as export_recipes_to_markdown_workflow,
     export_recipes_to_paprika_result as export_recipes_to_paprika_workflow,
     export_recipes_to_tandoor_result as export_recipes_to_tandoor_workflow,
+    find_mealie_duplicates as find_mealie_duplicates_workflow,
+    find_mealie_empty_recipes as find_mealie_empty_recipes_workflow,
+    find_mealie_broken_recipes as find_mealie_broken_recipes_workflow,
+    repair_mealie_recipes as repair_mealie_recipes_workflow,
+    create_mealie_cookbooks as create_mealie_cookbooks_workflow,
+    categorize_mealie_recipes as categorize_mealie_recipes_workflow,
     get_discovery_list_recipes,
     get_discovery_screen,
     get_kptncook_access_token as get_kptncook_access_token_workflow,
@@ -207,6 +214,190 @@ def sync():
     """
     save_todays_recipes()
     sync_with_mealie()
+
+
+@app.command(name="deduplicate-mealie")
+def deduplicate_mealie(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List duplicates without deleting."
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Delete without confirmation."
+    ),
+):
+    """
+    Delete Mealie recipes named '<name> (N)' when '<name>' also exists.
+    """
+    duplicates = _run_or_exit(find_mealie_duplicates_workflow)
+    if not duplicates:
+        rprint("No duplicate recipes found.")
+        return
+    rprint(f"Found {len(duplicates)} duplicate recipe(s):")
+    for duplicate in duplicates:
+        rprint(f"  - {duplicate.name} ({duplicate.slug})")
+    if dry_run:
+        return
+    if not force:
+        typer.confirm(f"Delete these {len(duplicates)} recipe(s)?", abort=True)
+    result = _run_or_exit(delete_mealie_duplicates_workflow, duplicates)
+    rprint(f"Deleted {len(result.deleted)} recipe(s).")
+    if result.failed:
+        rprint(f"[red]{len(result.failed)} deletion(s) failed:[/red]")
+        for duplicate, error in result.failed:
+            rprint(f"  - {duplicate.name} ({duplicate.slug}): {error}")
+
+
+@app.command(name="delete-empty-mealie")
+def delete_empty_mealie(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List empty recipes without deleting."
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Delete without confirmation."
+    ),
+):
+    """
+    Delete empty Mealie recipes (failed imports with no steps and no ingredients).
+    """
+    empty = _run_or_exit(find_mealie_empty_recipes_workflow)
+    if not empty:
+        rprint("No empty recipes found.")
+        return
+    rprint(f"Found {len(empty)} empty recipe(s):")
+    for ref in empty:
+        rprint(f"  - {ref.name} ({ref.slug})")
+    if dry_run:
+        return
+    if not force:
+        typer.confirm(f"Delete these {len(empty)} recipe(s)?", abort=True)
+    result = _run_or_exit(delete_mealie_duplicates_workflow, empty)
+    rprint(f"Deleted {len(result.deleted)} recipe(s).")
+    if result.failed:
+        rprint(f"[red]{len(result.failed)} deletion(s) failed:[/red]")
+        for ref, error in result.failed:
+            rprint(f"  - {ref.name} ({ref.slug}): {error}")
+
+
+@app.command(name="repair-mealie")
+def repair_mealie(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List broken recipes without changing anything."
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Repair without confirmation."
+    ),
+):
+    """
+    Re-import Mealie recipes that failed to import (only the default placeholder
+    step) by deleting them and recreating from local kptncook recipes matched by
+    name.
+    """
+    broken = _run_or_exit(find_mealie_broken_recipes_workflow)
+    if not broken:
+        rprint("No broken recipes found.")
+        return
+    rprint(f"Found {len(broken)} broken recipe(s):")
+    for ref in broken:
+        rprint(f"  - {ref.name} ({ref.slug})")
+    if dry_run:
+        return
+    if not force:
+        typer.confirm(
+            f"Delete and re-create these {len(broken)} recipe(s)?", abort=True
+        )
+    result = _run_or_exit(repair_mealie_recipes_workflow, broken)
+    rprint(f"Repaired {len(result.repaired)} recipe(s).")
+    if result.unmatched:
+        rprint(
+            f"[yellow]{len(result.unmatched)} had no local source "
+            "(left unchanged):[/yellow]"
+        )
+        for ref in result.unmatched:
+            rprint(f"  - {ref.name}")
+    if result.failed:
+        rprint(f"[red]{len(result.failed)} failed:[/red]")
+        for ref, error in result.failed:
+            rprint(f"  - {ref.name} ({ref.slug}): {error}")
+
+
+@app.command(name="create-mealie-cookbooks")
+def create_mealie_cookbooks(
+    tag: Optional[list[str]] = typer.Option(
+        None, "--tag", "-t", help="Category tag to make a cookbook for (repeatable)."
+    ),
+    require: Optional[list[str]] = typer.Option(
+        None, "--require", "-r", help="Tag every cookbook requires (repeatable)."
+    ),
+    public: bool = typer.Option(False, "--public", help="Make the cookbooks public."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would happen without changing Mealie."
+    ),
+):
+    """
+    Create a Mealie cookbook per kptncook category tag, each requiring the given
+    tags (default: main_dish and peanut_free).
+    """
+    category_tags = tag or [
+        "cooking_time_under_20",
+        "diet_high_protein",
+        "diet_vegetarian",
+    ]
+    require_tags = ["main_dish", "peanut_free"] if require is None else require
+    result = _run_or_exit(
+        create_mealie_cookbooks_workflow,
+        category_tags=category_tags,
+        require_tags=require_tags,
+        public=public,
+        dry_run=dry_run,
+    )
+    if result.created:
+        label = "Would create" if dry_run else "Created"
+        rprint(f"{label}: {', '.join(result.created)}")
+    if result.updated:
+        label = "Would update" if dry_run else "Updated"
+        rprint(f"{label}: {', '.join(result.updated)}")
+    if result.missing_tags:
+        rprint(
+            "[yellow]Skipped (tag not in Mealie):[/yellow] "
+            + ", ".join(result.missing_tags)
+        )
+    if not (result.created or result.updated or result.missing_tags):
+        rprint("Nothing to do.")
+
+
+@app.command(name="categorize-mealie")
+def categorize_mealie(
+    no_tools: bool = typer.Option(
+        False, "--no-tools", help="Skip mapping kptncook equipment tags to tools."
+    ),
+    no_fix_cookbooks: bool = typer.Option(
+        False, "--no-fix-cookbooks", help="Do not repoint cookbooks to categories."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would change without writing to Mealie."
+    ),
+):
+    """
+    Add the 'kptncook' category to kptncook recipes, add rule-based categories
+    (e.g. main_vegetarian for diet_vegetarian + main_dish + peanut_free), and map
+    kptncook equipment tags to Mealie tools.
+    """
+    result = _run_or_exit(
+        categorize_mealie_recipes_workflow,
+        add_tools=not no_tools,
+        fix_cookbooks=not no_fix_cookbooks,
+        dry_run=dry_run,
+    )
+    prefix = "Would apply" if dry_run else "Applied"
+    rprint(f"Scanned {result.scanned} recipes.")
+    rprint(f"{prefix} 'kptncook' category to {result.kptncook_count} recipes.")
+    for category, count in result.rule_counts.items():
+        rprint(f"{prefix} '{category}' to {count} recipes.")
+    if result.tool_counts:
+        tools = ", ".join(f"{name} ({count})" for name, count in result.tool_counts.items())
+        rprint(f"{prefix} tools: {tools}")
+    if result.cookbooks_updated:
+        rprint("Repointed cookbooks: " + ", ".join(result.cookbooks_updated))
 
 
 @app.command(name="backup-favorites")

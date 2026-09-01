@@ -446,6 +446,58 @@ class MealieApiClient(BaseHttpClient):
         r.raise_for_status()
         return Recipe.model_validate(r.json())
 
+    def get_recipe_dict(self, slug):
+        # Raw JSON: the Recipe model doesn't alias camelCase fields like
+        # recipeIngredient/recipeInstructions, so callers that need those must
+        # read the unparsed payload.
+        r = self.get(f"/recipes/{slug}")
+        r.raise_for_status()
+        return r.json()
+
+    def get_all_tags(self) -> list[dict]:
+        return self._get_all_items("organizers/tags")
+
+    def get_all_categories(self) -> list[dict]:
+        return self._get_all_items("organizers/categories")
+
+    def get_all_tools(self) -> list[dict]:
+        return self._get_all_items("organizers/tools")
+
+    def create_category(self, name: str) -> dict:
+        r = self.post("/organizers/categories", json={"name": name})
+        r.raise_for_status()
+        return r.json()
+
+    def create_tool(self, name: str) -> dict:
+        r = self.post("/organizers/tools", json={"name": name})
+        r.raise_for_status()
+        return r.json()
+
+    def bulk_categorize(self, slugs: list[str], categories: list[dict]) -> None:
+        r = self.post(
+            "/recipes/bulk-actions/categorize",
+            json={"recipes": slugs, "categories": categories},
+        )
+        r.raise_for_status()
+
+    def patch_recipe(self, slug: str, payload: dict) -> dict:
+        r = self.request("PATCH", f"/recipes/{slug}", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def get_cookbooks(self) -> list[dict]:
+        return self._get_all_items("households/cookbooks")
+
+    def create_cookbook(self, payload: dict) -> dict:
+        r = self.post("/households/cookbooks", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def update_cookbook(self, cookbook_id, payload: dict) -> dict:
+        r = self.put(f"/households/cookbooks/{cookbook_id}", json=payload)
+        r.raise_for_status()
+        return r.json()
+
 
 def kptncook_to_mealie_ingredients(
     kptncook_ingredients: list[Ingredient] | None,

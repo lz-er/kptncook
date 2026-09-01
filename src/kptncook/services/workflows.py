@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 import httpx
+from rich.progress import track
 
 from kptncook.api import KptnCookClient, _collect_recipe_identifiers, parse_id
 from kptncook.config import get_settings
@@ -57,6 +59,47 @@ class SearchResult:
 class SyncWithMealieResult:
     created_count: int
     invalid_repository_entries: list[InvalidStoredRecipe]
+
+
+@dataclass(frozen=True)
+class MealieRecipeRef:
+    name: str
+    slug: str
+
+
+@dataclass(frozen=True)
+class MealieDeleteResult:
+    deleted: list[MealieRecipeRef]
+    failed: list[tuple[MealieRecipeRef, str]]
+
+
+@dataclass(frozen=True)
+class MealieRepairResult:
+    repaired: list[MealieRecipeRef]
+    unmatched: list[MealieRecipeRef]
+    failed: list[tuple[MealieRecipeRef, str]]
+
+
+@dataclass(frozen=True)
+class CookbookSyncResult:
+    created: list[str]
+    updated: list[str]
+    missing_tags: list[str]
+
+
+@dataclass(frozen=True)
+class CategoryRule:
+    require_tags: tuple[str, ...]
+    category: str
+
+
+@dataclass(frozen=True)
+class CategorizeResult:
+    scanned: int
+    kptncook_count: int
+    rule_counts: dict[str, int]
+    tool_counts: dict[str, int]
+    cookbooks_updated: list[str]
 
 
 @dataclass(frozen=True)
@@ -239,7 +282,11 @@ def sync_with_mealie_result() -> SyncWithMealieResult:
         if recipe.extras.get("kptncook_id") in ids_to_add
     ]
     created_slugs: list[str] = []
-    for recipe in recipes_to_add:
+    for recipe in track(
+        recipes_to_add,
+        description="Syncing to Mealie",
+        total=len(recipes_to_add),
+    ):
         try:
             created = client.create_recipe(recipe)
             created_slugs.append(created.slug)
@@ -261,6 +308,446 @@ def sync_with_mealie_result() -> SyncWithMealieResult:
 
 def sync_with_mealie() -> int:
     return sync_with_mealie_result().created_count
+
+
+# Matches Mealie's auto-deduplicated names like "Foo (1)", "Foo (2)".
+_NUMBERED_SUFFIX = re.compile(r"^(?P<base>.+?)\s*\((?P<n>\d+)\)$")
+
+
+def _normalize_recipe_name(name: str) -> str:
+    # Collapse whitespace runs and strip; Mealie sometimes stores stray trailing
+    # or duplicated spaces that would otherwise break exact base-name matching.
+    return " ".join(name.split())
+
+
+def _find_numbered_duplicates(recipes: Sequence[Any]) -> list[MealieRecipeRef]:
+    existing_names = {
+        _normalize_recipe_name(recipe.name) for recipe in recipes if recipe.name
+    }
+    duplicates: list[MealieRecipeRef] = []
+    for recipe in recipes:
+        name = recipe.name or ""
+        match = _NUMBERED_SUFFIX.match(name)
+        if match is None:
+            continue
+        base = _normalize_recipe_name(match.group("base"))
+        # Only a duplicate if the un-suffixed name also exists in Mealie.
+        if base and base in existing_names:
+            duplicates.append(MealieRecipeRef(name=name, slug=recipe.slug))
+    duplicates.sort(key=lambda duplicate: duplicate.name)
+    return duplicates
+
+
+def find_mealie_duplicates() -> list[MealieRecipeRef]:
+    client = get_mealie_client()
+    try:
+        recipes = client.get_all_recipes()
+    except httpx.HTTPStatusError as exc:
+        raise UserFacingError(
+            format_http_status_error(exc.response, action="listing Mealie recipes")
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise UserFacingError(format_request_error(exc)) from exc
+    return _find_numbered_duplicates(recipes)
+
+
+def delete_mealie_duplicates(
+    duplicates: Sequence[MealieRecipeRef],
+) -> MealieDeleteResult:
+    if not duplicates:
+        return MealieDeleteResult(deleted=[], failed=[])
+    client = get_mealie_client()
+    deleted: list[MealieRecipeRef] = []
+    failed: list[tuple[MealieRecipeRef, str]] = []
+    for duplicate in track(
+        duplicates,
+        description="Deleting duplicates",
+        total=len(duplicates),
+    ):
+        try:
+            client.delete_via_slug(duplicate.slug)
+            deleted.append(duplicate)
+        except httpx.HTTPError as exc:
+            failed.append((duplicate, str(exc)))
+    return MealieDeleteResult(deleted=deleted, failed=failed)
+
+
+def _is_empty_recipe(recipe_data: dict) -> bool:
+    # Failed imports leave a bare recipe with no steps and no ingredients;
+    # Mealie renders its "1 Cup Flour" / markdown-hint placeholders for these.
+    # Read the raw payload because the Recipe model doesn't alias these fields.
+    steps = recipe_data.get("recipeInstructions") or []
+    ingredients = recipe_data.get("recipeIngredient") or []
+    return not steps and not ingredients
+
+
+def find_mealie_empty_recipes() -> list[MealieRecipeRef]:
+    client = get_mealie_client()
+    try:
+        summaries = client.get_all_recipes()
+    except httpx.HTTPStatusError as exc:
+        raise UserFacingError(
+            format_http_status_error(exc.response, action="listing Mealie recipes")
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise UserFacingError(format_request_error(exc)) from exc
+    empty: list[MealieRecipeRef] = []
+    # The list endpoint omits steps/ingredients, so each recipe needs a detail
+    # fetch to tell empty imports apart from real recipes.
+    for summary in track(
+        summaries,
+        description="Scanning Mealie recipes",
+        total=len(summaries),
+    ):
+        try:
+            detail = client.get_recipe_dict(summary.slug)
+        except httpx.HTTPError:
+            continue
+        if _is_empty_recipe(detail):
+            name = detail.get("name") or summary.name or summary.slug
+            empty.append(MealieRecipeRef(name=name, slug=summary.slug))
+    empty.sort(key=lambda ref: ref.name)
+    return empty
+
+
+# Mealie's default step, left in place when an import never populated the steps.
+_DEFAULT_STEP_PREFIX = (
+    "Recipe steps as well as other fields in the recipe page support markdown syntax."
+)
+
+
+def _is_broken_recipe(recipe_data: dict) -> bool:
+    # A failed import either has no steps at all or only Mealie's default
+    # placeholder step (even when ingredients were imported).
+    steps = recipe_data.get("recipeInstructions") or []
+    if not steps:
+        return True
+    if len(steps) == 1:
+        text = (steps[0].get("text") or "").strip()
+        return text.startswith(_DEFAULT_STEP_PREFIX)
+    return False
+
+
+def find_mealie_broken_recipes() -> list[MealieRecipeRef]:
+    client = get_mealie_client()
+    try:
+        summaries = client.get_all_recipes()
+    except httpx.HTTPStatusError as exc:
+        raise UserFacingError(
+            format_http_status_error(exc.response, action="listing Mealie recipes")
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise UserFacingError(format_request_error(exc)) from exc
+    broken: list[MealieRecipeRef] = []
+    for summary in track(
+        summaries,
+        description="Scanning Mealie recipes",
+        total=len(summaries),
+    ):
+        try:
+            detail = client.get_recipe_dict(summary.slug)
+        except httpx.HTTPError:
+            continue
+        if _is_broken_recipe(detail):
+            name = detail.get("name") or summary.name or summary.slug
+            broken.append(MealieRecipeRef(name=name, slug=summary.slug))
+    broken.sort(key=lambda ref: ref.name)
+    return broken
+
+
+def _repository_recipes_by_name() -> dict[str, Any]:
+    repository_result = load_kptncook_recipes_from_repository()
+    by_name: dict[str, Any] = {}
+    for recipe in repository_result.recipes:
+        mealie_recipe = kptncook_to_mealie(recipe)
+        key = _normalize_recipe_name(mealie_recipe.name or "")
+        # Keep the first match; later duplicates in the repo don't matter here.
+        by_name.setdefault(key, mealie_recipe)
+    return by_name
+
+
+def repair_mealie_recipes(
+    broken: Sequence[MealieRecipeRef],
+) -> MealieRepairResult:
+    if not broken:
+        return MealieRepairResult(repaired=[], unmatched=[], failed=[])
+    repo_by_name = _repository_recipes_by_name()
+    client = get_mealie_client()
+    repaired: list[MealieRecipeRef] = []
+    unmatched: list[MealieRecipeRef] = []
+    failed: list[tuple[MealieRecipeRef, str]] = []
+    for ref in track(
+        broken,
+        description="Repairing recipes",
+        total=len(broken),
+    ):
+        source = repo_by_name.get(_normalize_recipe_name(ref.name))
+        if source is None:
+            unmatched.append(ref)
+            continue
+        try:
+            client.delete_via_slug(ref.slug)
+        except httpx.HTTPError as exc:
+            failed.append((ref, f"delete failed: {exc}"))
+            continue
+        try:
+            client.create_recipe(source.model_copy(deep=True))
+            repaired.append(ref)
+        except httpx.HTTPError as exc:
+            failed.append((ref, f"recreate failed: {exc}"))
+    return MealieRepairResult(repaired=repaired, unmatched=unmatched, failed=failed)
+
+
+def _tag_id_map(client: MealieApiClient) -> dict[str, str]:
+    # Case-insensitive lookup by tag name (and slug as a fallback).
+    mapping: dict[str, str] = {}
+    for tag in client.get_all_tags():
+        tag_id = tag.get("id")
+        if not tag_id:
+            continue
+        name = tag.get("name")
+        slug = tag.get("slug")
+        if name:
+            mapping[name.casefold()] = tag_id
+        if slug:
+            mapping.setdefault(slug.casefold(), tag_id)
+    return mapping
+
+
+def _cookbook_title(tag: str) -> str:
+    return tag.replace("_", " ").title()
+
+
+def create_mealie_cookbooks(
+    *,
+    category_tags: Sequence[str],
+    require_tags: Sequence[str],
+    public: bool = False,
+    dry_run: bool = False,
+) -> CookbookSyncResult:
+    client = get_mealie_client()
+    try:
+        tag_ids = _tag_id_map(client)
+        existing = {cb["name"]: cb for cb in client.get_cookbooks()}
+    except httpx.HTTPStatusError as exc:
+        raise UserFacingError(
+            format_http_status_error(
+                exc.response, action="reading Mealie tags/cookbooks"
+            )
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise UserFacingError(format_request_error(exc)) from exc
+
+    missing_required = [t for t in require_tags if t.casefold() not in tag_ids]
+    if missing_required:
+        raise UserFacingError(
+            "Required tags not found in Mealie: " + ", ".join(missing_required)
+        )
+    require_ids = [tag_ids[t.casefold()] for t in require_tags]
+
+    created: list[str] = []
+    updated: list[str] = []
+    missing_tags: list[str] = []
+    for tag in category_tags:
+        key = tag.casefold()
+        if key not in tag_ids:
+            missing_tags.append(tag)
+            continue
+        ids = [tag_ids[key], *require_ids]
+        query = "tags.id CONTAINS ALL [" + ",".join(f'"{i}"' for i in ids) + "]"
+        title = _cookbook_title(tag)
+        parts = [tag, *require_tags]
+        payload = {
+            "name": title,
+            "description": "kptncook: " + " + ".join(parts),
+            "public": public,
+            "queryFilterString": query,
+        }
+        if dry_run:
+            (updated if title in existing else created).append(title)
+            continue
+        if title in existing:
+            current = existing[title]
+            client.update_cookbook(current["id"], {**current, **payload})
+            updated.append(title)
+        else:
+            client.create_cookbook(payload)
+            created.append(title)
+    return CookbookSyncResult(
+        created=created, updated=updated, missing_tags=missing_tags
+    )
+
+
+DEFAULT_CATEGORY_RULES: tuple[CategoryRule, ...] = (
+    CategoryRule(("diet_vegetarian", "main_dish", "peanut_free"), "main_vegetarian"),
+    CategoryRule(("diet_high_protein", "main_dish", "peanut_free"), "main_high_protein"),
+    CategoryRule(("cooking_time_under_20", "main_dish", "peanut_free"), "main_under_20"),
+)
+
+# kptncook encodes equipment as active tags; map the real ones to Mealie tools.
+DEFAULT_TOOL_MAP: dict[str, str] = {
+    "one_pot": "One Pot",
+    "casserole_dish": "Casserole Dish",
+    "grilled": "Grill",
+    "airfryer": "Air Fryer",
+    "muffin_tin": "Muffin Tin",
+    "waffle_iron": "Waffle Iron",
+}
+
+KPTNCOOK_CATEGORY = "kptncook"
+
+# (slug, source, tag names, existing tool names)
+_RecipeRecord = tuple[str, str | None, set[str], set[str]]
+
+
+def _plan_categorization(
+    records: Sequence[_RecipeRecord],
+    rules: Sequence[CategoryRule],
+    tool_map: dict[str, str],
+    add_tools: bool,
+) -> tuple[list[str], dict[str, list[str]], dict[str, set[str]]]:
+    kptncook_slugs = [slug for slug, source, _, _ in records if source == "kptncook"]
+    rule_slugs: dict[str, list[str]] = {}
+    for rule in rules:
+        required = set(rule.require_tags)
+        rule_slugs[rule.category] = [
+            slug for slug, _, tags, _ in records if required <= tags
+        ]
+    # slug -> full merged set of tool names to store (existing + newly derived)
+    tool_assignments: dict[str, set[str]] = {}
+    if add_tools:
+        for slug, _, tags, existing_tools in records:
+            wanted = {tool_map[t] for t in tags if t in tool_map}
+            if wanted - existing_tools:
+                tool_assignments[slug] = existing_tools | wanted
+    return kptncook_slugs, rule_slugs, tool_assignments
+
+
+def _bulk_categorize(
+    client: MealieApiClient, slugs: Sequence[str], category: dict
+) -> None:
+    payload_category = [
+        {"id": category["id"], "name": category["name"], "slug": category["slug"]}
+    ]
+    for start in range(0, len(slugs), 200):
+        client.bulk_categorize(list(slugs[start : start + 200]), payload_category)
+
+
+def categorize_mealie_recipes(
+    *,
+    rules: Sequence[CategoryRule] = DEFAULT_CATEGORY_RULES,
+    tool_map: dict[str, str] | None = None,
+    add_tools: bool = True,
+    fix_cookbooks: bool = True,
+    dry_run: bool = False,
+) -> CategorizeResult:
+    tool_map = DEFAULT_TOOL_MAP if tool_map is None else tool_map
+    client = get_mealie_client()
+    try:
+        summaries = client.get_all_recipes()
+    except httpx.HTTPStatusError as exc:
+        raise UserFacingError(
+            format_http_status_error(exc.response, action="listing Mealie recipes")
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise UserFacingError(format_request_error(exc)) from exc
+
+    # Single pass: fetch each recipe's tags, source and existing tools.
+    records: list[_RecipeRecord] = []
+    for summary in track(
+        summaries, description="Scanning Mealie recipes", total=len(summaries)
+    ):
+        try:
+            detail = client.get_recipe_dict(summary.slug)
+        except httpx.HTTPError:
+            continue
+        tags = {t.get("name") for t in (detail.get("tags") or []) if t.get("name")}
+        recipe_tools = {
+            t.get("name") for t in (detail.get("tools") or []) if t.get("name")
+        }
+        source = (detail.get("extras") or {}).get("source")
+        records.append((summary.slug, source, tags, recipe_tools))  # type: ignore[arg-type]
+
+    kptncook_slugs, rule_slugs, tool_assignments = _plan_categorization(
+        records, rules, tool_map, add_tools
+    )
+    rule_counts = {rule.category: len(rule_slugs[rule.category]) for rule in rules}
+    tool_counts: dict[str, int] = {}
+    for names in tool_assignments.values():
+        for name in names:
+            if name in tool_map.values():
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+
+    if dry_run:
+        return CategorizeResult(
+            scanned=len(records),
+            kptncook_count=len(kptncook_slugs),
+            rule_counts=rule_counts,
+            tool_counts=tool_counts,
+            cookbooks_updated=[],
+        )
+
+    categories = {c["name"]: c for c in client.get_all_categories()}
+
+    def ensure_category(name: str) -> dict:
+        if name not in categories:
+            categories[name] = client.create_category(name)
+        return categories[name]
+
+    if kptncook_slugs:
+        _bulk_categorize(client, kptncook_slugs, ensure_category(KPTNCOOK_CATEGORY))
+    for rule in rules:
+        slugs = rule_slugs[rule.category]
+        if slugs:
+            _bulk_categorize(client, slugs, ensure_category(rule.category))
+
+    if add_tools and tool_assignments:
+        tools = {t["name"]: t for t in client.get_all_tools()}
+
+        def ensure_tool(name: str) -> dict:
+            if name not in tools:
+                tools[name] = client.create_tool(name)
+            return tools[name]
+
+        for slug, tool_names in track(
+            tool_assignments.items(),
+            description="Setting recipe tools",
+            total=len(tool_assignments),
+        ):
+            payload_tools = [
+                {"id": (t := ensure_tool(n))["id"], "name": t["name"], "slug": t["slug"]}
+                for n in sorted(tool_names)
+            ]
+            try:
+                client.patch_recipe(slug, {"tools": payload_tools})
+            except httpx.HTTPError:
+                continue
+
+    cookbooks_updated: list[str] = []
+    if fix_cookbooks:
+        # Repoint each rule's cookbook to filter by its single category, which
+        # (unlike multi-tag CONTAINS ALL) paginates correctly in Mealie.
+        existing_cookbooks = {cb["name"]: cb for cb in client.get_cookbooks()}
+        for rule in rules:
+            title = _cookbook_title(rule.require_tags[0])
+            cookbook = existing_cookbooks.get(title)
+            category = categories.get(rule.category)
+            if cookbook is None or category is None:
+                continue
+            query = f'recipe_category.id IN ["{category["id"]}"]'
+            client.update_cookbook(
+                cookbook["id"], {**cookbook, "queryFilterString": query}
+            )
+            cookbooks_updated.append(title)
+
+    return CategorizeResult(
+        scanned=len(records),
+        kptncook_count=len(kptncook_slugs),
+        rule_counts=rule_counts,
+        tool_counts=tool_counts,
+        cookbooks_updated=cookbooks_updated,
+    )
+
 
 
 def backup_kptncook_favorites() -> FavoritesBackupResult:
