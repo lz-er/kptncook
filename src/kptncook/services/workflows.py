@@ -8,6 +8,7 @@ from datetime import date
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 from rich.progress import track
 
 from kptncook.api import KptnCookClient, _collect_recipe_identifiers, parse_id
@@ -59,6 +60,14 @@ class SearchResult:
 class SyncWithMealieResult:
     created_count: int
     invalid_repository_entries: list[InvalidStoredRecipe]
+
+
+@dataclass(frozen=True)
+class DailiesSyncResult:
+    saved_count: int
+    created_count: int
+    skipped_count: int
+    invalid_count: int
 
 
 @dataclass(frozen=True)
@@ -276,10 +285,19 @@ def sync_with_mealie_result() -> SyncWithMealieResult:
     ids_in_mealie = {r.extras["kptncook_id"] for r in kptncook_recipes_from_mealie}
     ids_from_api = {r.extras["kptncook_id"] for r in kptncook_recipes_from_repository}
     ids_to_add = ids_from_api - ids_in_mealie
+    # Also guard by name: Mealie appends "(1)" on any name collision, and a
+    # recipe's kptncook_id can change between fetches (e.g. dailies), so id-only
+    # dedup would recreate the same recipe under a numbered name.
+    names_in_mealie = {
+        _normalize_recipe_name(recipe.name or "")
+        for recipe in client.get_all_recipes()
+        if recipe.name
+    }
     recipes_to_add = [
         recipe
         for recipe in kptncook_recipes_from_repository
         if recipe.extras.get("kptncook_id") in ids_to_add
+        and _normalize_recipe_name(recipe.name or "") not in names_in_mealie
     ]
     created_slugs: list[str] = []
     for recipe in track(
@@ -308,6 +326,63 @@ def sync_with_mealie_result() -> SyncWithMealieResult:
 
 def sync_with_mealie() -> int:
     return sync_with_mealie_result().created_count
+
+
+def sync_dailies_with_mealie_result() -> DailiesSyncResult:
+    """Fetch today's recipes and add only the new ones to Mealie.
+
+    Deduplicates by recipe name (not kptncook id), so re-running for the daily
+    picks never creates "(1)" name collisions, and it skips the full-library
+    scan that `sync-with-mealie` does.
+    """
+    client = get_mealie_client()
+    names_in_mealie = {
+        _normalize_recipe_name(recipe.name or "")
+        for recipe in client.get_all_recipes()
+        if recipe.name
+    }
+    todays = get_today_recipes()
+    saved = _save_repository_entries(todays)
+
+    mealie_recipes = []
+    invalid = 0
+    for entry in todays:
+        try:
+            kptncook_recipe = Recipe.model_validate(entry.data)
+        except ValidationError:
+            invalid += 1
+            continue
+        mealie_recipes.append(kptncook_to_mealie(kptncook_recipe))
+
+    to_create = [
+        mealie_recipe
+        for mealie_recipe in mealie_recipes
+        if _normalize_recipe_name(mealie_recipe.name or "") not in names_in_mealie
+    ]
+    created = 0
+    for mealie_recipe in track(
+        to_create, description="Adding dailies to Mealie", total=len(to_create)
+    ):
+        try:
+            client.create_recipe(mealie_recipe)
+            created += 1
+            names_in_mealie.add(_normalize_recipe_name(mealie_recipe.name or ""))
+        except httpx.HTTPStatusError as exc:
+            detail_message = extract_mealie_detail_message(exc.response)
+            if detail_message == "Recipe already exists":
+                continue
+            logger.warning(
+                "Failed to create daily %s in Mealie (%s): %s",
+                mealie_recipe.name,
+                exc.response.status_code,
+                detail_message or exc,
+            )
+    return DailiesSyncResult(
+        saved_count=saved,
+        created_count=created,
+        skipped_count=len(mealie_recipes) - len(to_create),
+        invalid_count=invalid,
+    )
 
 
 # Matches Mealie's auto-deduplicated names like "Foo (1)", "Foo (2)".

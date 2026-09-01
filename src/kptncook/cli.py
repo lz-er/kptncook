@@ -50,6 +50,7 @@ from kptncook.services.workflows import (
     list_popular_ingredients as list_popular_ingredients_workflow,
     save_todays_recipes as save_todays_recipes_workflow,
     search_recipe_by_id as search_recipe_by_id_workflow,
+    sync_dailies_with_mealie_result as sync_dailies_with_mealie_workflow,
     sync_with_mealie_result as sync_with_mealie_workflow,
 )
 from kptncook.setup import setup as setup_command
@@ -214,6 +215,26 @@ def sync():
     """
     save_todays_recipes()
     sync_with_mealie()
+
+
+@app.command(name="sync-dailies-with-mealie")
+def sync_dailies_with_mealie():
+    """
+    Fetch today's recipes and add only the new ones to Mealie, matched by name
+    (so it won't create '(1)' duplicates) and without re-syncing the whole
+    library.
+    """
+    result = _run_or_exit(sync_dailies_with_mealie_workflow)
+    rprint(f"Saved {result.saved_count} recipe(s) locally.")
+    rprint(
+        f"Added {result.created_count} new recipe(s) to Mealie "
+        f"({result.skipped_count} already present)."
+    )
+    if result.invalid_count:
+        rprint(
+            f"[yellow]{result.invalid_count} daily recipe(s) could not be "
+            "parsed.[/yellow]"
+        )
 
 
 @app.command(name="deduplicate-mealie")

@@ -140,6 +140,9 @@ def test_sync_with_mealie_skips_duplicates_and_logs_other_failures(
                 raise _status_error(500, detail_message="upstream exploded")
             return SimpleNamespace(slug=f"created-{recipe_id}")
 
+        def get_all_recipes(self):
+            return []
+
     fake_client = FakeClient()
 
     monkeypatch.setattr(workflows, "get_mealie_client", lambda: fake_client)
@@ -194,6 +197,9 @@ def test_sync_with_mealie_prefilters_recipes_already_present_in_mealie(
             recipe_id = recipe_to_create.extras["kptncook_id"]
             seen_ids.append(recipe_id)
             return SimpleNamespace(slug=f"created-{recipe_id}")
+
+        def get_all_recipes(self):
+            return [mealie_recipes[0]]
 
     fake_client = FakeClient()
 
@@ -724,6 +730,74 @@ def test_plan_categorization_can_skip_tools():
         records, (), {"one_pot": "One Pot"}, add_tools=False
     )
     assert tool_assignments == {}
+
+
+def test_sync_with_mealie_skips_recipes_with_existing_name(monkeypatch, minimal):
+    # A repository recipe whose kptncook_id is new but whose name already exists
+    # in Mealie must NOT be recreated (that is what produced '(1)' duplicates).
+    repository_recipes = [_recipe(minimal, oid="new-id")]
+    mealie_recipe = SimpleNamespace(name="Garnelen", extras={"kptncook_id": "new-id"})
+    seen_ids: list[str] = []
+
+    class FakeClient:
+        def create_recipe(self, recipe_to_create):
+            seen_ids.append(recipe_to_create.extras["kptncook_id"])
+            return SimpleNamespace(slug="created")
+
+        def get_all_recipes(self):
+            # Same name already present under a different id.
+            return [SimpleNamespace(name="Garnelen", slug="garnelen")]
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+    monkeypatch.setattr(
+        workflows, "get_kptncook_recipes_from_mealie", lambda _client: []
+    )
+    monkeypatch.setattr(
+        workflows,
+        "load_kptncook_recipes_from_repository",
+        lambda: RepositoryRecipesResult(recipes=repository_recipes, invalid_entries=[]),
+    )
+    monkeypatch.setattr(
+        workflows, "kptncook_to_mealie", lambda recipe: mealie_recipe
+    )
+
+    result = workflows.sync_with_mealie_result()
+
+    assert result.created_count == 0
+    assert seen_ids == []
+
+
+def test_sync_dailies_with_mealie_skips_existing_names(monkeypatch, minimal):
+    todays = [_recipe_in_db(minimal, oid="d1"), _recipe_in_db(minimal, oid="d2")]
+    created: list[str] = []
+    names = {"d1": "Existing Daily", "d2": "New Daily"}
+
+    class FakeClient:
+        def get_all_recipes(self):
+            return [SimpleNamespace(name="Existing Daily", slug="existing-daily")]
+
+        def create_recipe(self, recipe):
+            created.append(recipe.name)
+            return SimpleNamespace(slug="new")
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+    monkeypatch.setattr(workflows, "get_today_recipes", lambda: todays)
+    monkeypatch.setattr(
+        workflows, "_save_repository_entries", lambda entries: len(entries)
+    )
+    monkeypatch.setattr(
+        workflows,
+        "kptncook_to_mealie",
+        lambda recipe: SimpleNamespace(name=names[recipe.id.oid], extras={}),
+    )
+
+    result = workflows.sync_dailies_with_mealie_result()
+
+    assert created == ["New Daily"]
+    assert result.created_count == 1
+    assert result.skipped_count == 1
+    assert result.saved_count == 2
+    assert result.invalid_count == 0
 
 
 

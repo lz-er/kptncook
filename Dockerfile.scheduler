@@ -9,8 +9,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # bash is required by the scheduler/sync scripts; tzdata makes TZ work.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash tzdata \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir kptncook
+    && rm -rf /var/lib/apt/lists/*
+
+# Install kptncook from the local source so local fixes ship (the PyPI release
+# lacks the name-based dedup and the sync-dailies-with-mealie command).
+COPY pyproject.toml README.md /app/
+COPY src/ /app/src/
+RUN pip install --no-cache-dir /app
 
 COPY scripts/ /scripts/
 RUN chmod +x /scripts/*.sh

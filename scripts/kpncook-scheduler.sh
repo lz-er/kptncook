@@ -114,8 +114,8 @@ favorites_enabled() {
 }
 
 daily_job() {
-    log "Daily job: kptncook sync (dailies + Mealie push)"
-    if ! kc sync; then
+    log "Daily job: add today's recipes to Mealie"
+    if ! kc sync-dailies-with-mealie; then
         log "WARN: daily sync failed"
     fi
     if favorites_enabled; then

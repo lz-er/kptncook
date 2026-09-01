@@ -109,6 +109,12 @@ Commands:
   search-by-id              Search for a recipe by id in kptncook api, id...
   sync                      Fetch recipes for today from api, save them to...
   sync-with-mealie          Sync locally saved recipes with mealie.
+  sync-dailies-with-mealie  Add only today's new recipes to Mealie (by name).
+  deduplicate-mealie        Delete Mealie '<name> (N)' recipes when '<name>' exists.
+  delete-empty-mealie       Delete empty Mealie recipes (no steps and no ingredients).
+  repair-mealie             Re-import failed Mealie imports from local recipes.
+  create-mealie-cookbooks   Create a Mealie cookbook per category tag.
+  categorize-mealie         Add categories + tools and repoint cookbooks.
   export-recipes-to-paprika  Export a recipe by id or all recipes to Paprika app
   export-recipes-to-tandoor  Export a recipe by id or all recipes to Tandoor
   export-recipes-to-markdown Export a recipe by id or all recipes to Markdown files
@@ -230,6 +236,111 @@ printing or saving.
 ```shell
 $ kptncook onboarding --tag rt:diet_vegetarian
 $ kptncook onboarding --tag "low-carb,high-protein" --save
+```
+
+## Mealie maintenance
+
+These commands operate on an existing Mealie instance (they need `MEALIE_URL`
+plus `MEALIE_API_TOKEN` or `MEALIE_USERNAME`/`MEALIE_PASSWORD`). Each scans all
+Mealie recipes, so runtime scales with the size of your Mealie library. All of
+them support `--dry-run` to preview without changing anything, and the deleting
+ones support `--force`/`-f` to skip the confirmation prompt.
+
+### sync-dailies-with-mealie
+
+Fetches today's recipes, saves them to the local repository, and adds only the
+new ones to Mealie — matched by recipe **name**. `sync-with-mealie` dedupes by
+kptncook id, but a recipe's id can differ between fetches (notably for the daily
+picks), so it would recreate an already-present recipe under a numbered name
+(`Recipe (1)`). This command dedupes by name instead, so it never creates those
+duplicates, and it skips the full-library scan `sync-with-mealie` performs.
+
+```shell
+$ kptncook sync-dailies-with-mealie
+```
+
+### deduplicate-mealie
+
+When the same recipe is pushed twice, Mealie keeps the original and appends a
+numeric suffix (`Recipe (1)`, `Recipe (2)`). This command deletes those numbered
+duplicates, but only when a recipe with the un-suffixed base name still exists.
+Stray/duplicated whitespace that Mealie sometimes stores in names is ignored
+when matching.
+
+```shell
+$ kptncook deduplicate-mealie --dry-run   # list the '(N)' duplicates
+$ kptncook deduplicate-mealie             # asks before deleting
+$ kptncook deduplicate-mealie --force     # delete without confirmation
+```
+
+### delete-empty-mealie
+
+Deletes recipes that have no steps and no ingredients at all (bare shells left
+by a failed import). Recipes that still have a placeholder step or some
+ingredients are left alone; use `repair-mealie` for those.
+
+```shell
+$ kptncook delete-empty-mealie --dry-run
+$ kptncook delete-empty-mealie --force
+```
+
+### repair-mealie
+
+Some imports fail after the recipe shell is created, leaving Mealie's default
+placeholder step (“Recipe steps as well as other fields … support markdown
+syntax.”) instead of the real instructions. This command finds those broken
+recipes, matches each to a locally stored kptncook recipe by name, then deletes
+the broken one and re-creates it from the local data. Broken recipes with no
+local match are reported and left unchanged.
+
+```shell
+$ kptncook repair-mealie --dry-run
+$ kptncook repair-mealie             # asks before deleting/re-creating
+$ kptncook repair-mealie --force
+```
+
+### create-mealie-cookbooks
+
+Creates one Mealie cookbook per category tag, filtered to recipes that carry the
+category tag **and** every required tag. `--tag`/`-t` (repeatable) sets the
+category tags (default: `cooking_time_under_20`, `diet_high_protein`,
+`diet_vegetarian`); `--require`/`-r` (repeatable) sets the tags every cookbook
+requires (default: `main_dish`, `peanut_free`). Re-running updates the existing
+cookbook instead of duplicating it. Add `--public` to make the cookbooks public.
+Tags that do not exist in Mealie are reported and skipped.
+
+```shell
+$ kptncook create-mealie-cookbooks --dry-run
+$ kptncook create-mealie-cookbooks
+$ kptncook create-mealie-cookbooks -t diet_vegan -t cuisine_italian -r main_dish -r peanut_free
+```
+
+Note: on some Mealie builds a multi-tag cookbook filter paginates incorrectly
+(it shows only a few recipes). `categorize-mealie` works around this by
+repointing the cookbooks to a single category filter.
+
+### categorize-mealie
+
+Does three things in one pass over your Mealie recipes:
+
+- adds the `kptncook` category to every kptncook-sourced recipe;
+- adds rule-based categories — a recipe that has all of a rule's tags gets that
+  rule's category (defaults: `diet_vegetarian + main_dish + peanut_free →
+  main_vegetarian`, `diet_high_protein + main_dish + peanut_free →
+  main_high_protein`, `cooking_time_under_20 + main_dish + peanut_free →
+  main_under_20`);
+- maps kptncook equipment tags to Mealie tools (One Pot, Casserole Dish, Grill,
+  Air Fryer, Muffin Tin, Waffle Iron).
+
+Existing categories are preserved (categories are appended, not replaced). By
+default it also repoints the matching cookbooks to filter by the single
+category, which paginates reliably. Use `--no-tools` to skip tools and
+`--no-fix-cookbooks` to leave cookbook filters untouched.
+
+```shell
+$ kptncook categorize-mealie --dry-run
+$ kptncook categorize-mealie
+$ kptncook categorize-mealie --no-tools --no-fix-cookbooks
 ```
 
 ## Environment
