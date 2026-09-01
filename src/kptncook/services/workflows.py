@@ -395,6 +395,12 @@ def _normalize_recipe_name(name: str) -> str:
     return " ".join(name.split())
 
 
+def _strip_numbered_suffix(name: str) -> str:
+    # "Foo (1)" -> "Foo"; leaves un-suffixed names unchanged.
+    match = _NUMBERED_SUFFIX.match(name or "")
+    return match.group("base") if match else (name or "")
+
+
 def _find_numbered_duplicates(recipes: Sequence[Any]) -> list[MealieRecipeRef]:
     existing_names = {
         _normalize_recipe_name(recipe.name) for recipe in recipes if recipe.name
@@ -548,28 +554,69 @@ def repair_mealie_recipes(
         return MealieRepairResult(repaired=[], unmatched=[], failed=[])
     repo_by_name = _repository_recipes_by_name()
     client = get_mealie_client()
+    existing_names = {
+        _normalize_recipe_name(recipe.name or "")
+        for recipe in client.get_all_recipes()
+        if recipe.name
+    }
     repaired: list[MealieRecipeRef] = []
     unmatched: list[MealieRecipeRef] = []
     failed: list[tuple[MealieRecipeRef, str]] = []
+
+    def _recreate(source: Any, base_name: str) -> tuple[bool, str | None]:
+        try:
+            client.create_recipe(source.model_copy(deep=True))
+        except httpx.HTTPStatusError as exc:
+            # Mealie rejects duplicate names outright, so treat that as "the
+            # clean recipe already exists" rather than a failure.
+            if extract_mealie_detail_message(exc.response) == "Recipe already exists":
+                existing_names.add(base_name)
+                return True, None
+            return False, f"recreate failed: {exc}"
+        except httpx.HTTPError as exc:
+            return False, f"recreate failed: {exc}"
+        existing_names.add(base_name)
+        return True, None
+
+    def _delete(ref: MealieRecipeRef) -> tuple[bool, str | None]:
+        try:
+            client.delete_via_slug(ref.slug)
+        except httpx.HTTPError as exc:
+            return False, f"delete failed: {exc}"
+        existing_names.discard(_normalize_recipe_name(ref.name))
+        return True, None
+
     for ref in track(
         broken,
         description="Repairing recipes",
         total=len(broken),
     ):
-        source = repo_by_name.get(_normalize_recipe_name(ref.name))
+        # Failed imports are often named "<name> (N)"; match the un-suffixed name.
+        base_name = _normalize_recipe_name(_strip_numbered_suffix(ref.name))
+        source = repo_by_name.get(base_name)
         if source is None:
             unmatched.append(ref)
             continue
-        try:
-            client.delete_via_slug(ref.slug)
-        except httpx.HTTPError as exc:
-            failed.append((ref, f"delete failed: {exc}"))
-            continue
-        try:
-            client.create_recipe(source.model_copy(deep=True))
+        is_suffixed = _normalize_recipe_name(ref.name) != base_name
+        if is_suffixed:
+            if base_name in existing_names:
+                # A clean copy already exists; the broken one is just a duplicate.
+                ok, err = _delete(ref)
+            else:
+                # Recreate the clean recipe first (the name is free), then remove
+                # the broken copy, so a failure never loses the only version.
+                ok, err = _recreate(source, base_name)
+                if ok:
+                    ok, err = _delete(ref)
+        else:
+            # A clean-named broken recipe occupies the name; delete then recreate.
+            ok, err = _delete(ref)
+            if ok:
+                ok, err = _recreate(source, base_name)
+        if ok:
             repaired.append(ref)
-        except httpx.HTTPError as exc:
-            failed.append((ref, f"recreate failed: {exc}"))
+        else:
+            failed.append((ref, err or "failed"))
     return MealieRepairResult(repaired=repaired, unmatched=unmatched, failed=failed)
 
 

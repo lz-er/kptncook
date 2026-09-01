@@ -621,6 +621,9 @@ def test_repair_mealie_recipes_deletes_and_recreates_matched(monkeypatch, minima
             created.append(recipe.name)
             return SimpleNamespace(slug="new-slug")
 
+        def get_all_recipes(self):
+            return []
+
     monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
     monkeypatch.setattr(
         workflows,
@@ -638,6 +641,72 @@ def test_repair_mealie_recipes_deletes_and_recreates_matched(monkeypatch, minima
     assert [ref.slug for ref in result.repaired] == ["minimal-recipe"]
     assert [ref.slug for ref in result.unmatched] == ["unknown-recipe"]
     assert result.failed == []
+
+
+def test_repair_mealie_recreates_suffixed_broken_without_base(monkeypatch, minimal):
+    # A lone "X (1)" broken import with no clean "X" -> delete it and recreate X.
+    source = workflows.kptncook_to_mealie(_recipe(minimal))
+    broken = [workflows.MealieRecipeRef(name=f"{source.name} (1)", slug="x-1")]
+    deleted: list[str] = []
+    created: list[str] = []
+
+    class FakeClient:
+        def get_all_recipes(self):
+            return []
+
+        def delete_via_slug(self, slug):
+            deleted.append(slug)
+            return {}
+
+        def create_recipe(self, recipe):
+            created.append(recipe.name)
+            return SimpleNamespace(slug="new")
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+    monkeypatch.setattr(
+        workflows,
+        "_repository_recipes_by_name",
+        lambda: {workflows._normalize_recipe_name(source.name): source},
+    )
+
+    result = workflows.repair_mealie_recipes(broken)
+
+    assert deleted == ["x-1"]
+    assert created == [source.name]
+    assert [ref.slug for ref in result.repaired] == ["x-1"]
+
+
+def test_repair_mealie_deletes_suffixed_broken_when_base_exists(monkeypatch, minimal):
+    # "X (1)" broken but a clean "X" already exists -> just delete the broken one.
+    source = workflows.kptncook_to_mealie(_recipe(minimal))
+    broken = [workflows.MealieRecipeRef(name=f"{source.name} (1)", slug="x-1")]
+    deleted: list[str] = []
+    created: list[str] = []
+
+    class FakeClient:
+        def get_all_recipes(self):
+            return [SimpleNamespace(name=source.name, slug="x")]
+
+        def delete_via_slug(self, slug):
+            deleted.append(slug)
+            return {}
+
+        def create_recipe(self, recipe):
+            created.append(recipe.name)
+            return SimpleNamespace(slug="new")
+
+    monkeypatch.setattr(workflows, "get_mealie_client", lambda: FakeClient())
+    monkeypatch.setattr(
+        workflows,
+        "_repository_recipes_by_name",
+        lambda: {workflows._normalize_recipe_name(source.name): source},
+    )
+
+    result = workflows.repair_mealie_recipes(broken)
+
+    assert deleted == ["x-1"]
+    assert created == []  # base already present -> no recreate, no new collision
+    assert [ref.slug for ref in result.repaired] == ["x-1"]
 
 
 def test_create_mealie_cookbooks_creates_updates_and_skips(monkeypatch):
