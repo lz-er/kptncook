@@ -270,14 +270,49 @@ def test_backup_kptncook_favorites_resolves_and_saves_recipes(monkeypatch, minim
         "_save_repository_entries",
         lambda recipes: len(recipes),
     )
+    monkeypatch.setattr(workflows, "_repository_id_map", lambda: {})
 
     result = workflows.backup_kptncook_favorites()
 
-    assert result == workflows.FavoritesBackupResult(favorite_count=3, saved_count=2)
+    assert result == workflows.FavoritesBackupResult(
+        favorite_count=3, saved_count=2, new_count=0
+    )
     assert captured["required"] is True
     assert captured["client"] is fake_client
     assert captured["items"] == [("oid", "favorite-1"), ("oid", "favorite-2")]
     assert captured["action"] == "resolving recipes"
+
+
+def test_backup_kptncook_favorites_reports_new_count(monkeypatch, minimal):
+    resolved = [_recipe_in_db(minimal, oid="f1"), _recipe_in_db(minimal, oid="f2")]
+    favorites = [{"id": "f1"}, {"id": "f2"}]
+
+    class FakeClient:
+        def list_favorites(self):
+            return favorites
+
+    monkeypatch.setattr(workflows, "_require_access_token", lambda: None)
+    monkeypatch.setattr(workflows, "KptnCookClient", lambda: FakeClient())
+    monkeypatch.setattr(
+        workflows,
+        "_collect_recipe_identifiers",
+        lambda items: [("oid", item["id"]) for item in items],
+    )
+    monkeypatch.setattr(
+        workflows,
+        "_resolve_recipe_summaries",
+        lambda client, items, *, action: resolved,
+    )
+    monkeypatch.setattr(workflows, "_save_repository_entries", lambda recipes: len(recipes))
+    # Repo had 1 entry before saving, 2 after -> exactly 1 new recipe.
+    id_maps = [{"existing": 1}, {"existing": 1, "f2": 2}]
+    monkeypatch.setattr(workflows, "_repository_id_map", lambda: id_maps.pop(0))
+
+    result = workflows.backup_kptncook_favorites()
+
+    assert result.favorite_count == 2
+    assert result.saved_count == 2
+    assert result.new_count == 1
 
 
 def test_get_discovery_list_recipes_resolves_list_items(monkeypatch, minimal):

@@ -79,6 +79,7 @@ def track(
 class FavoritesBackupResult:
     favorite_count: int
     saved_count: int
+    new_count: int
 
 
 @dataclass(frozen=True)
@@ -944,10 +945,15 @@ def backup_kptncook_favorites() -> FavoritesBackupResult:
     if len(recipes) == 0:
         raise UserFacingError("Could not find any favorites")
 
+    # Count how many favorites are genuinely new by comparing the stored id set
+    # before and after saving (add_list dedupes by id).
+    existing_before = len(_repository_id_map())
     saved_count = _save_repository_entries(recipes)
+    new_count = len(_repository_id_map()) - existing_before
     return FavoritesBackupResult(
         favorite_count=len(favorites),
         saved_count=saved_count,
+        new_count=new_count,
     )
 
 

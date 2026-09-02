@@ -432,7 +432,11 @@ def backup_kptncook_favorites():
     """
     result = _run_or_exit(backup_kptncook_favorites_workflow)
     rprint(f"Found {result.favorite_count} favorites")
-    rprint(f"Added {result.saved_count} recipes to local repository")
+    rprint(
+        f"Backed up {result.saved_count} recipe(s) to local repository "
+        f"({result.new_count} new, "
+        f"{result.saved_count - result.new_count} already stored)."
+    )
 
 
 @app.command(name="kptncook-access-token")
