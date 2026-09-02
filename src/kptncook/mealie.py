@@ -421,20 +421,27 @@ class MealieApiClient(BaseHttpClient):
         return validated_recipes
 
     def get_all_recipes(self):
-        all_recipes = []
-
-        r = self.get("/recipes?page=1&perPage=50")
-        r.raise_for_status()
-        all_recipes.extend(self.validate_recipes(r.json()["items"]))
-
-        page = 2
-        while page <= r.json()["total_pages"]:
-            r = self.get(f"/recipes?page={page}&perPage=50")
+        # Order by the immutable id so pagination is stable. Mealie's default
+        # ordering shifts rows between pages, which silently drops and
+        # duplicates recipes; dedupe by id as a second safety net.
+        seen: dict = {}
+        page = 1
+        while True:
+            r = self.get(
+                f"/recipes?page={page}&perPage=100&orderBy=id&orderDirection=asc"
+            )
             r.raise_for_status()
-            all_recipes.extend(self.validate_recipes(r.json()["items"]))
+            data = r.json()
+            items = data.get("items", [])
+            if not items:
+                break
+            for item in items:
+                seen[item.get("id") or item.get("slug")] = item
+            if page >= data.get("total_pages", 1):
+                break
             page += 1
 
-        return all_recipes
+        return self.validate_recipes(list(seen.values()))
 
     def delete_via_slug(self, slug):
         r = self.delete(f"/recipes/{slug}")
