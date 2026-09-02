@@ -35,6 +35,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*"; }
+banner() {
+    log "======================================================"
+    log "$*"
+    log "======================================================"
+}
 
 # ---------- Load .env (so a bare run sees the same vars as the CLI) ----------
 # The file is sourced as trusted shell (like the CLI, it may hold tokens and
@@ -133,10 +138,17 @@ daily_job() {
 
 weekly_job() {
     log "Weekly job: full sweep via $SYNC_SCRIPT"
+    local ok=1
     if ! bash "$SYNC_SCRIPT"; then
-        log "WARN: weekly job failed"
+        log "WARN: weekly sweep failed"
+        ok=0
     fi
     maintenance_job
+    if [[ "$ok" == "1" ]]; then
+        banner "Weekly job complete ($(date '+%Y-%m-%d %H:%M %Z'))"
+    else
+        banner "Weekly job finished WITH WARNINGS (sweep failed)"
+    fi
 }
 
 # Mealie housekeeping: repair failed imports, remove duplicates, ensure the

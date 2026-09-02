@@ -125,6 +125,8 @@ def test_sync_with_mealie_command_smoke_renders_warning_summary(monkeypatch):
         "sync_with_mealie_workflow",
         lambda: SyncWithMealieResult(
             created_count=2,
+            skipped_count=1,
+            repository_count=3,
             invalid_repository_entries=[
                 InvalidStoredRecipe(
                     position=2,
@@ -141,7 +143,8 @@ def test_sync_with_mealie_command_smoke_renders_warning_summary(monkeypatch):
     assert "Warning:" in result.output
     assert "skipped 1 invalid stored recipe" in result.output
     assert "- broken: steps: Field required" in result.output
-    assert "Created 2 recipes" in result.output
+    assert "created 2" in result.output
+    assert "1 already present" in result.output
 
 
 def test_access_token_command_saves_token_without_printing_it(monkeypatch, tmp_path):

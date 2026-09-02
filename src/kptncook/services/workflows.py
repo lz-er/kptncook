@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+import sys
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import ValidationError
-from rich.progress import track
+from rich.progress import track as _rich_track
 
 from kptncook.api import KptnCookClient, _collect_recipe_identifiers, parse_id
 from kptncook.config import get_settings
@@ -42,6 +43,37 @@ from kptncook.tandoor import TandoorExporter
 logger = logging.getLogger(__name__)
 SHARE_URL_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 
+_T = TypeVar("_T")
+
+
+def track(
+    iterable: Iterable[_T], *, description: str, total: int | None = None
+) -> Iterator[_T]:
+    """Iterate with progress feedback.
+
+    Uses rich's animated bar on a TTY; in non-interactive contexts (Docker
+    logs, piped output) it emits periodic plain-text lines instead, since the
+    animated bar renders nothing useful there.
+    """
+    if total is None:
+        try:
+            total = len(iterable)  # type: ignore[arg-type]
+        except TypeError:
+            total = None
+    if sys.stdout.isatty():
+        yield from _rich_track(iterable, description=description, total=total)
+        return
+    count = 0
+    step = max(1, (total or 200) // 10)
+    for item in iterable:
+        yield item
+        count += 1
+        if total is not None and (count % step == 0 or count == total):
+            print(f"{description}: {count}/{total}", flush=True)
+    if total is None:
+        print(f"{description}: {count} done", flush=True)
+
+
 
 @dataclass(frozen=True)
 class FavoritesBackupResult:
@@ -59,6 +91,8 @@ class SearchResult:
 @dataclass(frozen=True)
 class SyncWithMealieResult:
     created_count: int
+    skipped_count: int
+    repository_count: int
     invalid_repository_entries: list[InvalidStoredRecipe]
 
 
@@ -220,8 +254,18 @@ def get_mealie_client() -> MealieApiClient:
 
 def get_kptncook_recipes_from_mealie(client: MealieApiClient) -> list[Any]:
     recipes = client.get_all_recipes()
-    recipes_with_details = [client.get_via_slug(recipe.slug) for recipe in recipes]
-    return [r for r in recipes_with_details if r.extras.get("source") == "kptncook"]
+    kptncook_recipes = []
+    # One detail fetch per recipe to read extras; show progress since this is
+    # the slow part of a sync on a large library.
+    for recipe in track(
+        recipes,
+        description="Scanning Mealie recipes",
+        total=len(recipes),
+    ):
+        detail = client.get_via_slug(recipe.slug)
+        if detail.extras.get("source") == "kptncook":
+            kptncook_recipes.append(detail)
+    return kptncook_recipes
 
 
 def get_kptncook_recipes_from_repository():
@@ -320,6 +364,8 @@ def sync_with_mealie_result() -> SyncWithMealieResult:
             )
     return SyncWithMealieResult(
         created_count=len(created_slugs),
+        skipped_count=len(kptncook_recipes_from_repository) - len(recipes_to_add),
+        repository_count=len(kptncook_recipes_from_repository),
         invalid_repository_entries=repository_result.invalid_entries,
     )
 

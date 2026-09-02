@@ -204,7 +204,11 @@ def sync_with_mealie():
     """
     result = _run_or_exit(sync_with_mealie_workflow)
     _print_repository_warnings(result.invalid_repository_entries)
-    rprint(f"Created {result.created_count} recipes")
+    rprint(
+        f"Mealie sync: created {result.created_count}, "
+        f"{result.skipped_count} already present "
+        f"(of {result.repository_count} local recipes)."
+    )
 
 
 @app.command(name="sync")
